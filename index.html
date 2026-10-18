@@ -134,6 +134,48 @@ with check (
   )
 );
 
+-- Group creators can invite users through this guarded RPC. The website never
+-- receives permission to add arbitrary membership rows directly.
+create or replace function public.orbit_invite_to_group(target_chat_id uuid, target_user_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  creator_id uuid;
+  is_group_chat boolean;
+begin
+  if auth.uid() is null then
+    raise exception 'Sign in before inviting people';
+  end if;
+
+  select c.created_by, c.is_group
+    into creator_id, is_group_chat
+  from public.chats c
+  where c.id = target_chat_id;
+
+  if not found or is_group_chat is distinct from true then
+    raise exception 'Group not found';
+  end if;
+  if creator_id <> auth.uid() then
+    raise exception 'Only the group creator can invite people';
+  end if;
+  if target_user_id = auth.uid() then
+    return;
+  end if;
+  if not exists (select 1 from auth.users u where u.id = target_user_id) then
+    raise exception 'That account does not exist';
+  end if;
+
+  insert into public.chat_members(chat_id, user_id)
+  values (target_chat_id, target_user_id)
+  on conflict do nothing;
+end;
+$$;
+revoke all on function public.orbit_invite_to_group(uuid, uuid) from public;
+grant execute on function public.orbit_invite_to_group(uuid, uuid) to authenticated;
+
 -- Admins can list every group, without being inserted into chat_members.
 drop policy if exists "orbit admins can view all groups" on public.chats;
 create policy "orbit admins can view all groups"
