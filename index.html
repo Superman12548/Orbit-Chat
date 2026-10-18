@@ -1,63 +1,168 @@
--- Orbit Chat role security and admin tools
--- Run this in Supabase Dashboard -> SQL Editor -> New query.
--- Make sure the account ambrosewang@westminster.net already exists in Auth before running this.
+-- Orbit Chat roles, admin tools, and group-chat access.
+-- Run the ENTIRE script in Supabase Dashboard -> SQL Editor -> New query.
+-- Ensure ambrosewang@westminster.net already exists in Supabase Auth.
 
 create table if not exists public.orbit_user_roles (
   user_id uuid primary key references auth.users(id) on delete cascade,
   role text not null default 'member' check (role in ('member', 'admin')),
   updated_at timestamptz not null default now()
 );
-
 alter table public.orbit_user_roles enable row level security;
 
+-- SECURITY DEFINER helpers use an empty search_path and schema-qualified objects.
 create or replace function public.orbit_is_admin()
 returns boolean
-language sql
-stable
-security definer
-set search_path = public
+language sql stable security definer
+set search_path = ''
 as $$
   select exists (
-    select 1
-    from public.orbit_user_roles r
-    where r.user_id = auth.uid()
-      and r.role = 'admin'
+    select 1 from public.orbit_user_roles r
+    where r.user_id = auth.uid() and r.role = 'admin'
   );
 $$;
-
 revoke all on function public.orbit_is_admin() from public;
 grant execute on function public.orbit_is_admin() to authenticated;
 
-drop policy if exists "orbit roles read self or admin" on public.orbit_user_roles;
-create policy "orbit roles read self or admin"
-on public.orbit_user_roles
-for select
-to authenticated
-using (user_id = auth.uid() or public.orbit_is_admin());
+create or replace function public.orbit_can_view_group(target_chat_id uuid)
+returns boolean
+language sql stable security definer
+set search_path = ''
+as $$
+  select exists (
+    select 1 from public.chats c
+    where c.id = target_chat_id
+      and c.is_group = true
+      and (
+        public.orbit_is_admin()
+        or exists (
+          select 1 from public.chat_members cm
+          where cm.chat_id = c.id and cm.user_id = auth.uid()
+        )
+      )
+  );
+$$;
+revoke all on function public.orbit_can_view_group(uuid) from public;
+grant execute on function public.orbit_can_view_group(uuid) to authenticated;
 
--- The frontend cannot directly insert/update/delete roles. Role changes must use the RPC below.
+create or replace function public.orbit_can_view_profile(target_user_id uuid)
+returns boolean
+language sql stable security definer
+set search_path = ''
+as $$
+  select
+    target_user_id = auth.uid()
+    or public.orbit_is_admin()
+    or exists (
+      select 1
+      from public.chat_members mine
+      join public.chat_members theirs on theirs.chat_id = mine.chat_id
+      join public.chats c on c.id = mine.chat_id
+      where mine.user_id = auth.uid()
+        and theirs.user_id = target_user_id
+        and c.is_group = true
+    );
+$$;
+revoke all on function public.orbit_can_view_profile(uuid) from public;
+grant execute on function public.orbit_can_view_profile(uuid) to authenticated;
+
+create or replace function public.orbit_can_view_role(target_user_id uuid)
+returns boolean
+language sql stable security definer
+set search_path = ''
+as $$
+  select
+    target_user_id = auth.uid()
+    or public.orbit_is_admin()
+    or exists (
+      select 1
+      from public.chat_members mine
+      join public.chat_members theirs on theirs.chat_id = mine.chat_id
+      join public.chats c on c.id = mine.chat_id
+      where mine.user_id = auth.uid()
+        and theirs.user_id = target_user_id
+        and c.is_group = true
+    );
+$$;
+revoke all on function public.orbit_can_view_role(uuid) from public;
+grant execute on function public.orbit_can_view_role(uuid) to authenticated;
+
+-- Roles: users may read their own role; admins may read all roles; members can
+-- see the roles of people who share one of their groups.
+drop policy if exists "orbit roles read self or admin" on public.orbit_user_roles;
+drop policy if exists "orbit roles visible to authorized users" on public.orbit_user_roles;
+create policy "orbit roles visible to authorized users"
+on public.orbit_user_roles for select to authenticated
+using (public.orbit_can_view_role(user_id));
+
+-- Clients cannot write role rows directly. The guarded RPC below is the only
+-- intended way to assign roles from the app.
 drop policy if exists "orbit roles no client writes" on public.orbit_user_roles;
 create policy "orbit roles no client writes"
-on public.orbit_user_roles
-for all
-to authenticated
-using (false)
-with check (false);
+on public.orbit_user_roles for all to authenticated
+using (false) with check (false);
 
--- Let admins see the member directory used by the admin panel.
+-- Profiles: admins can see the member directory; group members can see profiles
+-- for other people in their group. Existing profile policies are left intact.
 alter table public.profiles enable row level security;
 drop policy if exists "orbit admins can view profiles" on public.profiles;
 create policy "orbit admins can view profiles"
-on public.profiles
-for select
-to authenticated
+on public.profiles for select to authenticated
 using (public.orbit_is_admin());
+drop policy if exists "orbit group members can view profiles" on public.profiles;
+create policy "orbit group members can view profiles"
+on public.profiles for select to authenticated
+using (public.orbit_can_view_profile(id));
+
+-- Chat creation: the creator must be the currently signed-in user.
+drop policy if exists "orbit authenticated users create chats" on public.chats;
+create policy "orbit authenticated users create chats"
+on public.chats for insert to authenticated
+with check (created_by = (select auth.uid()));
+
+-- Let a group creator add only their own membership row. Other membership
+-- changes still depend on the app's existing policies.
+drop policy if exists "orbit group creator adds self" on public.chat_members;
+create policy "orbit group creator adds self"
+on public.chat_members for insert to authenticated
+with check (
+  user_id = (select auth.uid())
+  and exists (
+    select 1 from public.chats c
+    where c.id = chat_members.chat_id
+      and c.is_group = true
+      and c.created_by = (select auth.uid())
+  )
+);
+
+-- Admins can list every group, without being inserted into chat_members.
+drop policy if exists "orbit admins can view all groups" on public.chats;
+create policy "orbit admins can view all groups"
+on public.chats for select to authenticated
+using (is_group = true and public.orbit_is_admin());
+
+-- Group membership lists are visible to actual group members and admins.
+-- The helper avoids recursive RLS checks against chat_members.
+drop policy if exists "orbit authorized users view group members" on public.chat_members;
+create policy "orbit authorized users view group members"
+on public.chat_members for select to authenticated
+using (user_id = (select auth.uid()) or public.orbit_can_view_group(chat_id));
+
+-- Admins can read messages in group chats only, not private direct messages.
+drop policy if exists "orbit admins can read group messages" on public.messages;
+create policy "orbit admins can read group messages"
+on public.messages for select to authenticated
+using (
+  public.orbit_is_admin()
+  and exists (
+    select 1 from public.chats c
+    where c.id = messages.chat_id and c.is_group = true
+  )
+);
 
 create or replace function public.orbit_set_user_role(target_user_id uuid, new_role text)
 returns void
-language plpgsql
-security definer
-set search_path = public
+language plpgsql security definer
+set search_path = ''
 as $$
 declare
   admin_count integer;
@@ -65,15 +170,13 @@ begin
   if auth.uid() is null or not public.orbit_is_admin() then
     raise exception 'Only an admin can change member roles';
   end if;
-
   if new_role not in ('admin', 'member') then
     raise exception 'Role must be admin or member';
   end if;
 
   if target_user_id = auth.uid() and new_role = 'member' then
     select count(*) into admin_count
-    from public.orbit_user_roles
-    where role = 'admin';
+    from public.orbit_user_roles where role = 'admin';
     if admin_count <= 1 then
       raise exception 'You cannot remove the last admin';
     end if;
@@ -85,19 +188,29 @@ begin
   do update set role = excluded.role, updated_at = now();
 end;
 $$;
-
 revoke all on function public.orbit_set_user_role(uuid, text) from public;
 grant execute on function public.orbit_set_user_role(uuid, text) to authenticated;
 
 create or replace function public.orbit_delete_chat(target_chat_id uuid)
 returns void
-language plpgsql
-security definer
-set search_path = public
+language plpgsql security definer
+set search_path = ''
 as $$
+declare
+  target_is_group boolean;
 begin
   if auth.uid() is null or not public.orbit_is_admin() then
     raise exception 'Only an admin can delete conversations';
+  end if;
+
+  select c.is_group into target_is_group
+  from public.chats c where c.id = target_chat_id;
+  if not found then
+    raise exception 'Conversation not found';
+  end if;
+  -- This admin tool is intended for groups, not users' private DMs.
+  if target_is_group is distinct from true then
+    raise exception 'Admins can only delete group chats with this tool';
   end if;
 
   delete from public.messages where chat_id = target_chat_id;
@@ -105,12 +218,11 @@ begin
   delete from public.chats where id = target_chat_id;
 end;
 $$;
-
 revoke all on function public.orbit_delete_chat(uuid) from public;
 grant execute on function public.orbit_delete_chat(uuid) to authenticated;
 
--- Assign the initial admin role to the existing account.
--- If this inserts zero rows, create/sign up for that account first and run this section again.
+-- Make this account an admin if it exists in Auth. If no row is inserted,
+-- sign up/sign in that account first and run this final statement again.
 insert into public.orbit_user_roles(user_id, role, updated_at)
 select id, 'admin', now()
 from auth.users
